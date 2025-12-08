@@ -18,12 +18,25 @@ AI-powered clothing detection and style evaluation system with React frontend an
 
 1. **Extract the ZIP file** containing this codebase
 
-2. **Install Python dependencies:**
+2. **Create `.env` file** (Required):
+   ```bash
+   # Create .env file in the root directory
+   echo "OPENAI_API_KEY=your_openai_key_here" > .env
+   ```
+   
+   **Or manually create `.env` file** with:
+   ```
+   OPENAI_API_KEY=your_openai_key_here
+   ```
+   
+   > **Note:** Replace `your_openai_key_here` with your actual OpenAI API key. This is required for the style evaluation feature.
+
+3. **Install Python dependencies:**
    ```bash
    uv sync
    ```
 
-3. **Install Frontend dependencies:**
+4. **Install Frontend dependencies:**
    ```bash
    cd frontend
    npm install
@@ -89,31 +102,6 @@ npm run dev -- --host
 ├── pyproject.toml              # Python dependencies (for uv)
 └── README.md                   # This file
 ```
-
-## Environment Variables (Optional)
-
-For style evaluation feature, set:
-```bash
-export OPENAI_API_KEY=your_openai_key_here
-```
-
-## Troubleshooting
-
-### Port Already in Use
-If port 5000 or 5173 is already in use:
-- Backend: Edit `backend_api.py` and change the port number
-- Frontend: Edit `frontend/vite.config.ts` and change the port
-
-### Can't Access from Phone
-1. Make sure both devices are on the same WiFi network
-2. Check firewall settings - allow ports 5000 and 5173
-3. Verify the IP address is correct
-4. Try accessing from computer first: `http://localhost:5173`
-
-### Camera Not Working on Phone
-- Grant camera permissions when browser asks
-- Make sure you're using `http://` not `https://`
-- Some browsers may require HTTPS for camera access
 
 ## License
 
