@@ -1,0 +1,23 @@
+[project]
+name = "clothing-analysis"
+version = "1.0.0"
+description = "AI-powered clothing detection and style evaluation system"
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "torchvision",
+    "pillow",
+    "numpy",
+    "tqdm",
+    "opencv-python",
+    "matplotlib",
+    "openai",
+    "python-dotenv",
+    "flask",
+    "flask-cors",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+

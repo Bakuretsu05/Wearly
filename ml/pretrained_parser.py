@@ -1,0 +1,1061 @@
+"""
+Pre-trained Human Parsing Model for Clothing Segmentation
+Segments: shirt, pants, shoes
+Uses pre-trained models that work out-of-the-box without training.
+"""
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image, ImageDraw, ImageFont, ExifTags
+from typing import Dict, Tuple, Optional
+import colorsys
+
+# Matplotlib for visualization (optional)
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend to avoid display issues
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+
+# OpenCV for image processing
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    print("[Warning] OpenCV not available. Install with: pip install opencv-python")
+
+# Try to use segmentation-models-pytorch (best option)
+try:
+    import segmentation_models_pytorch as smp
+    SMP_AVAILABLE = True
+except ImportError:
+    SMP_AVAILABLE = False
+
+# Try to use detectron2 (alternative)
+try:
+    import detectron2
+    from detectron2 import model_zoo
+    from detectron2.engine import DefaultPredictor
+    from detectron2.config import get_cfg
+    DETECTRON2_AVAILABLE = True
+except ImportError:
+    DETECTRON2_AVAILABLE = False
+
+
+def apply_exif_orientation(image: Image.Image) -> Image.Image:
+    """
+    Apply EXIF orientation to image if present.
+    iPhone photos often have EXIF orientation tags that need to be applied.
+    """
+    try:
+        # Check for EXIF orientation tag
+        if hasattr(image, '_getexif') and image._getexif() is not None:
+            exif = image._getexif()
+            # Orientation tag is 274 (0x0112)
+            orientation = exif.get(274)  # or ExifTags.ORIENTATION
+        elif hasattr(image, 'getexif'):
+            exif = image.getexif()
+            orientation = exif.get(274)
+        else:
+            return image
+        
+        if orientation is None:
+            return image
+        
+        # Apply rotation based on EXIF orientation
+        if orientation == 2:
+            # Mirrored horizontally
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+        elif orientation == 3:
+            # Rotated 180°
+            image = image.rotate(180, expand=True)
+        elif orientation == 4:
+            # Mirrored vertically
+            image = image.transpose(Image.FLIP_TOP_BOTTOM)
+        elif orientation == 5:
+            # Mirrored horizontally then rotated 90° CCW
+            image = image.transpose(Image.FLIP_LEFT_RIGHT).rotate(90, expand=True)
+        elif orientation == 6:
+            # Rotated 90° CW (need to rotate 90° CCW)
+            image = image.rotate(-90, expand=True)
+        elif orientation == 7:
+            # Mirrored horizontally then rotated 90° CW
+            image = image.transpose(Image.FLIP_LEFT_RIGHT).rotate(-90, expand=True)
+        elif orientation == 8:
+            # Rotated 90° CCW (need to rotate 90° CW)
+            image = image.rotate(90, expand=True)
+    except (AttributeError, KeyError, TypeError):
+        # No EXIF data or error reading it, return as-is
+        pass
+    
+    return image
+
+
+def load_image_with_orientation(image_path: str) -> Image.Image:
+    """
+    Load an image and apply EXIF orientation if present.
+    This fixes the issue where iPhone photos taken in portrait mode
+    appear rotated when processed.
+    """
+    img = Image.open(image_path)
+    img = apply_exif_orientation(img)
+    return img.convert('RGB')
+
+
+def is_skin_color(r: int, g: int, b: int) -> bool:
+    """
+    Detect if a color is likely skin/flesh tone.
+    Skin colors typically have:
+    - Hue in orange/peach range (8-45 degrees is most common for skin)
+    - Moderate saturation (0.2-0.6) - skin is not very saturated
+    - Medium to high brightness (0.35-0.95)
+    - R > G > B (typical skin tone gradient)
+    """
+    r_f, g_f, b_f = r / 255.0, g / 255.0, b / 255.0
+    h, s, v = colorsys.rgb_to_hsv(r_f, g_f, b_f)
+    h_deg = h * 360.0
+    
+    # Skin color detection - more specific to avoid false positives on clothing
+    # Hue: typically in the orange/peach range (8-45 degrees is most common)
+    # Also allow near-red (350-360) for some skin tones
+    hue_ok = (h_deg >= 8 and h_deg <= 45) or (h_deg >= 350)
+    
+    # Saturation: moderate but not too high (0.15-0.65) - skin is not very vibrant
+    # Lower bound allows darker skin tones, upper bound avoids pure red clothing
+    sat_ok = s >= 0.15 and s <= 0.65
+    
+    # Brightness: medium to high (0.25-0.95) - allow darker skin tones
+    val_ok = v >= 0.25 and v <= 0.95
+    
+    # Critical: R should be higher than B, and G should be closer to R than B
+    # This distinguishes skin (peach/orange) from pure red clothing
+    # For skin: typically R > G > B, and G is closer to R
+    rgb_ratio_ok = (r > b) and (g > b * 0.7) and (abs(r - g) < abs(g - b) * 2.0)
+    
+    # Additional check: avoid very saturated reds (pure red clothing)
+    # Skin has lower saturation than bright red clothing
+    not_pure_red = not ((h_deg < 15 or h_deg > 345) and s > 0.7 and r > g * 1.5)
+    
+    return hue_ok and sat_ok and val_ok and rgb_ratio_ok and not_pure_red
+
+
+def rgb_to_color_name(r: int, g: int, b: int) -> str:
+    """Convert RGB to color name that matches classifier labels"""
+    r_f, g_f, b_f = r / 255.0, g / 255.0, b / 255.0
+    h, s, v = colorsys.rgb_to_hsv(r_f, g_f, b_f)
+    h_deg = h * 360.0
+
+    # Blacks and whites
+    if v < 0.15:
+        return "black"
+    if v > 0.9 and s < 0.2:
+        return "white"
+
+    # Greys
+    if s < 0.2:
+        if v < 0.4:
+            return "dark grey"
+        elif v < 0.7:
+            return "grey"
+        else:
+            return "light grey"
+
+    # Chromatic colors
+    if (h_deg < 15) or (h_deg >= 345):
+        return "red"
+    if 15 <= h_deg < 45:
+        return "orange"
+    if 45 <= h_deg < 70:
+        return "yellow"
+    if 70 <= h_deg < 170:
+        return "green"
+    if 170 <= h_deg < 255:
+        return "blue"
+    if 255 <= h_deg < 290:
+        return "purple"
+    if 290 <= h_deg < 345:
+        return "magenta"
+
+    return "other"
+
+
+def extract_color_from_region(img_rgb: np.ndarray, mask: np.ndarray, region_name: Optional[str] = None, exclude_mask: Optional[np.ndarray] = None) -> Dict[str, Optional[str]]:
+    """
+    Extract dominant color from a region mask.
+    
+    Args:
+        img_rgb: RGB image array [H, W, 3]
+        mask: Boolean mask for the region [H, W]
+        region_name: Optional region name (e.g., "pants", "shirt", "top", "shoes") to apply region-specific filtering
+                     For pants/shirt/top regions, skin-colored pixels are filtered out (helps with shorts/short sleeves)
+                     For shoes region, pants-colored pixels are filtered out to prevent contamination
+        exclude_mask: Optional mask of pixels to exclude (e.g., pants mask when extracting shoes color)
+    """
+    if mask.sum() == 0:
+        return {"hex": None, "name": None, "rgb": None}
+    
+    # Remove pixels that overlap with exclude_mask (e.g., exclude pants pixels from shoes)
+    if exclude_mask is not None:
+        mask = mask & (~exclude_mask)
+    
+    if mask.sum() == 0:
+        return {"hex": None, "name": None, "rgb": None}
+    
+    # Get pixels in the region
+    pixels = img_rgb[mask]
+    
+    # Filter out extreme values (background, shadows)
+    brightness = pixels.mean(axis=1)
+    valid_mask = (brightness > 20) & (brightness < 235)
+    valid_pixels = pixels[valid_mask]
+    
+    # For pants region, filter out skin-colored pixels (common with shorts)
+    # For shirt/top region, filter out skin-colored pixels (common with short sleeves)
+    if region_name in ["pants", "shirt", "top"] and len(valid_pixels) > 0:
+        # Check each pixel for skin color
+        skin_mask = np.array([
+            not is_skin_color(int(p[0]), int(p[1]), int(p[2])) 
+            for p in valid_pixels
+        ])
+        non_skin_pixels = valid_pixels[skin_mask]
+        
+        # Only use filtered pixels if we have enough (at least 10% of original)
+        if len(non_skin_pixels) >= len(valid_pixels) * 0.1:
+            valid_pixels = non_skin_pixels
+        # If too many pixels were filtered out, likely not shorts/short sleeves, use original
+    
+    if len(valid_pixels) == 0:
+        return {"hex": None, "name": None, "rgb": None}
+    
+    # Use median (more robust than mean)
+    median_color = np.median(valid_pixels, axis=0).astype(np.uint8)
+    r, g, b = median_color.tolist()
+    hex_color = "#{:02X}{:02X}{:02X}".format(r, g, b)
+    color_name = rgb_to_color_name(r, g, b)
+    
+    return {
+        "hex": hex_color,
+        "name": color_name,
+        "rgb": [int(r), int(g), int(b)]
+    }
+
+
+# =========================
+# METHOD 1: Using segmentation-models-pytorch (HRNet/DeepLabV3)
+# =========================
+
+def load_smp_parser(model_name: str = "deeplabv3plus_resnet50") -> Optional[torch.nn.Module]:
+    """Load pre-trained segmentation model from smp"""
+    if not SMP_AVAILABLE:
+        return None
+    
+    try:
+        # Use a model pre-trained on ImageNet (we'll adapt it)
+        # For human parsing, we'll use a general segmentation model
+        model = smp.create_model(
+            model_name,
+            encoder_name="resnet50",
+            encoder_weights="imagenet",
+            in_channels=3,
+            classes=3,  # shirt, pants, shoes
+            activation=None,
+        )
+        model.eval()
+        return model
+    except Exception as e:
+        print(f"[Warning] Could not load SMP model: {e}")
+        return None
+
+
+def parse_with_smp(model: torch.nn.Module, image_path: str, device: torch.device) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Parse image using SMP model"""
+    # Load and preprocess image (with EXIF orientation correction)
+    img = load_image_with_orientation(image_path)
+    img_np = np.array(img)
+    h, w = img_np.shape[:2]
+    
+    if not CV2_AVAILABLE:
+        return img_np, parse_with_geometric(img_np)
+    
+    # Resize for model (typical input size)
+    img_resized = cv2.resize(img_np, (512, 512))
+    img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+    img_tensor = img_tensor.unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        output = model(img_tensor)
+        pred = output.argmax(dim=1).squeeze().cpu().numpy()
+    
+    # Resize prediction back to original size
+    pred = cv2.resize(pred.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+    
+    # Detect head region to exclude from shirt
+    head_mask = detect_head_region_mediapipe(img_np)
+    
+    # Create masks for each region (excluding head from shirt)
+    shirt_mask = (pred == 1)
+    # Remove head pixels from shirt mask
+    if head_mask is not None:
+        shirt_mask = shirt_mask & (~head_mask)
+    
+    masks = {
+        "shirt": shirt_mask,
+        "pants": (pred == 2),
+        "shoes": (pred == 3),
+    }
+    
+    return img_np, masks
+
+
+# =========================
+# METHOD 2: Simple Geometric Parser (Fallback - Always Works)
+# =========================
+
+def parse_with_geometric(img_rgb: np.ndarray) -> Dict[str, np.ndarray]:
+    """
+    Simple geometric parser that divides image into regions.
+    This is a fallback that always works, though less accurate.
+    Uses detected head region to exclude from shirt (if available).
+    """
+    h, w = img_rgb.shape[:2]
+    masks = {}
+    
+    # Try to detect head region (more precise)
+    head_mask = detect_head_region_mediapipe(img_rgb)
+    if head_mask is None or head_mask.sum() == 0:
+        # No head detected, just use top 15% as head estimate
+        head_y = int(h * 0.15)
+        head_mask = np.zeros((h, w), dtype=bool)
+        head_mask[:head_y, :] = True
+    
+    # Shirt: 15% to 50% of image (EXCLUDES detected head only)
+    shirt_y_start = int(h * 0.15)  # Start slightly lower to preserve shirt area
+    shirt_mask = np.zeros((h, w), dtype=bool)
+    shirt_mask[shirt_y_start:int(h * 0.50), :] = True
+    # Remove only the detected head pixels (more precise)
+    if head_mask is not None:
+        shirt_mask = shirt_mask & (~head_mask)
+    masks["shirt"] = shirt_mask
+    
+    # Pants: 50% to 85% of image
+    pants_mask = np.zeros((h, w), dtype=bool)
+    pants_mask[int(h * 0.50):int(h * 0.85), :] = True
+    masks["pants"] = pants_mask
+    
+    # Shoes: bottom 15% of image
+    shoes_mask = np.zeros((h, w), dtype=bool)
+    shoes_mask[int(h * 0.85):, :] = True
+    masks["shoes"] = shoes_mask
+    
+    return masks
+
+
+# =========================
+# METHOD 3: Using MediaPipe (if available)
+# =========================
+
+def detect_head_region_mediapipe(img_rgb: np.ndarray) -> Optional[np.ndarray]:
+    """Detect head/face region using MediaPipe Face Detection
+    Only excludes the actual detected face/head area, not the entire top portion.
+    """
+    try:
+        import mediapipe as mp
+        mp_face_detection = mp.solutions.face_detection
+        face_detection = mp_face_detection.FaceDetection(
+            model_selection=0,  # 0: short-range, 1: full-range
+            min_detection_confidence=0.5
+        )
+        
+        h, w = img_rgb.shape[:2]
+        results = face_detection.process(img_rgb)
+        
+        # Create mask from detected faces only (no geometric fallback)
+        head_mask = np.zeros((h, w), dtype=bool)
+        
+        if not results.detections:
+            # No face detected - don't exclude anything, return empty mask
+            return head_mask
+        
+        # Only exclude the actual detected face area
+        for detection in results.detections:
+            bbox = detection.location_data.relative_bounding_box
+            # Convert relative coordinates to pixel coordinates
+            x = int(bbox.xmin * w)
+            y = int(bbox.ymin * h)
+            width = int(bbox.width * w)
+            height = int(bbox.height * h)
+            
+            # Expand bounding box slightly to cover full head/face
+            # Use smaller expansion to avoid removing too much shirt area
+            expand_factor = 0.2  # Reduced from 0.3
+            x_expand = int(width * expand_factor)
+            y_expand = int(height * expand_factor)
+            x = max(0, x - x_expand)
+            y = max(0, y - y_expand)
+            width = min(w - x, width + 2 * x_expand)
+            height = min(h - y, height + 2 * y_expand)
+            
+            # Only mark the detected face area, not the entire top portion
+            head_mask[y:y+height, x:x+width] = True
+        
+        return head_mask
+    except ImportError:
+        # Fallback: return empty mask (don't exclude anything)
+        h, w = img_rgb.shape[:2]
+        return np.zeros((h, w), dtype=bool)
+    except Exception as e:
+        # Fallback: return empty mask (don't exclude anything)
+        h, w = img_rgb.shape[:2]
+        return np.zeros((h, w), dtype=bool)
+
+
+def parse_with_mediapipe(img_rgb: np.ndarray) -> Optional[Dict[str, np.ndarray]]:
+    """Parse using MediaPipe Selfie Segmentation"""
+    try:
+        import mediapipe as mp
+        mp_selfie_segmentation = mp.solutions.selfie_segmentation
+        selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(
+            model_selection=1  # 0: general, 1: landscape
+        )
+        
+        # MediaPipe expects RGB
+        results = selfie_segmentation.process(img_rgb)
+        person_mask = results.segmentation_mask > 0.5
+        
+        if person_mask.sum() == 0:
+            return None
+        
+        # Detect head/face region to exclude from shirt
+        head_mask = detect_head_region_mediapipe(img_rgb)
+        
+        # Divide person mask into regions (excluding head from shirt)
+        h, w = img_rgb.shape[:2]
+        masks = {}
+        
+        # Shirt: top 50% of person, but EXCLUDE only detected head/face region
+        shirt_y1 = int(h * 0.50)
+        shirt_mask = person_mask & (np.arange(h)[:, None] < shirt_y1)
+        # Remove only the detected head/face pixels (not entire top portion)
+        if head_mask is not None and head_mask.sum() > 0:
+            shirt_mask = shirt_mask & (~head_mask)
+        masks["shirt"] = shirt_mask
+        
+        # Pants: 50% to 85% of person
+        pants_y0, pants_y1 = int(h * 0.50), int(h * 0.85)
+        masks["pants"] = person_mask & (np.arange(h)[:, None] >= pants_y0) & (np.arange(h)[:, None] < pants_y1)
+        
+        # Shoes: bottom 15% of person
+        shoes_y = int(h * 0.85)
+        masks["shoes"] = person_mask & (np.arange(h)[:, None] >= shoes_y)
+        
+        return masks
+    except ImportError:
+        return None
+    except Exception as e:
+        print(f"[Warning] MediaPipe parsing failed: {e}")
+        return None
+
+
+# =========================
+# MAIN PARSING FUNCTION
+# =========================
+
+def remove_legs_from_pants_mask(img_rgb: np.ndarray, pants_mask: np.ndarray, is_shorts: bool = False) -> np.ndarray:
+    """
+    Remove leg/skin areas from pants mask when shorts are detected.
+    
+    Args:
+        img_rgb: RGB image array [H, W, 3]
+        pants_mask: Boolean mask for pants region [H, W]
+        is_shorts: If True, actively removes legs. If False, uses skin detection.
+    
+    Returns:
+        Adjusted pants mask with leg areas removed
+    """
+    if pants_mask.sum() == 0:
+        return pants_mask
+    
+    h, w = img_rgb.shape[:2]
+    adjusted_mask = pants_mask.copy()
+    
+    # Get pixels in the pants region
+    pants_pixels = img_rgb[pants_mask]
+    
+    if len(pants_pixels) == 0:
+        return adjusted_mask
+    
+    # Focus on the lower 60% of the pants region (where legs typically appear in shorts)
+    # Find the vertical bounds of the pants region
+    pants_rows = np.where(pants_mask.any(axis=1))[0]
+    if len(pants_rows) == 0:
+        return adjusted_mask
+    
+    # If shorts are detected, remove legs more aggressively
+    if is_shorts:
+        print("[Parsing] Shorts detected by classifier. Removing legs from pants mask.")
+        
+        # Remove skin-colored pixels from the entire pants mask
+        pants_pixels_rgb = img_rgb[pants_mask]  # [N, 3]
+        
+        # Vectorized skin color detection
+        skin_mask_vectorized = np.array([
+            is_skin_color(int(p[0]), int(p[1]), int(p[2])) for p in pants_pixels_rgb
+        ])
+        
+        # Find which pixels in pants_mask are skin-colored
+        pants_indices = np.where(pants_mask)
+        skin_pants_indices = (pants_indices[0][skin_mask_vectorized], 
+                             pants_indices[1][skin_mask_vectorized])
+        
+        # Remove skin pixels from adjusted mask
+        adjusted_mask[skin_pants_indices] = False
+        
+        # Additionally, remove the lower portion of pants region (where legs typically are)
+        pants_top = pants_rows[0]
+        pants_bottom = pants_rows[-1]
+        pants_height = pants_bottom - pants_top
+        # Remove bottom 50% of pants region (typical leg area in shorts)
+        leg_cutoff = pants_top + int(pants_height * 0.5)
+        # Create a mask for the lower portion that was originally part of pants
+        lower_leg_mask = pants_mask.copy()
+        lower_leg_mask[:leg_cutoff, :] = False  # Only keep bottom portion
+        # Remove this lower leg area from adjusted mask
+        adjusted_mask[lower_leg_mask] = False
+        
+    else:
+        # Original skin detection logic for auto-detection
+        pants_top = pants_rows[0]
+        pants_bottom = pants_rows[-1]
+        pants_height = pants_bottom - pants_top
+        lower_pants_start = pants_top + int(pants_height * 0.4)  # Lower 60% of pants region
+        
+        # Create mask for lower pants area
+        lower_pants_mask = pants_mask.copy()
+        lower_pants_mask[:lower_pants_start, :] = False
+        
+        # Check pixels in lower pants area for skin color
+        if lower_pants_mask.sum() > 0:
+            lower_pants_pixels = img_rgb[lower_pants_mask]
+            
+            # Count how many pixels in lower region are skin-colored
+            skin_pixel_count = 0
+            total_pixel_count = len(lower_pants_pixels)
+            
+            for pixel in lower_pants_pixels:
+                if is_skin_color(int(pixel[0]), int(pixel[1]), int(pixel[2])):
+                    skin_pixel_count += 1
+            
+            # If more than 30% of lower pants region is skin-colored, likely shorts with exposed legs
+            skin_ratio = skin_pixel_count / total_pixel_count if total_pixel_count > 0 else 0
+            
+            if skin_ratio > 0.3:
+                print(f"[Parsing] Auto-detected shorts (skin ratio in lower pants: {skin_ratio:.1%}). Removing legs from pants mask.")
+                
+                # Remove skin-colored pixels from the entire pants mask (vectorized for speed)
+                pants_pixels_rgb = img_rgb[pants_mask]  # [N, 3]
+                
+                # Vectorized skin color detection
+                skin_mask_vectorized = np.array([
+                    is_skin_color(int(p[0]), int(p[1]), int(p[2])) for p in pants_pixels_rgb
+                ])
+                
+                # Find which pixels in pants_mask are skin-colored
+                pants_indices = np.where(pants_mask)
+                skin_pants_indices = (pants_indices[0][skin_mask_vectorized], 
+                                     pants_indices[1][skin_mask_vectorized])
+                
+                # Remove skin pixels from adjusted mask
+                adjusted_mask[skin_pants_indices] = False
+    
+    return adjusted_mask
+
+
+def parse_clothing_regions(
+    image_path: str, 
+    device: torch.device = None,
+    visualize: bool = False,
+    vis_save_path: str = "parsed_regions_visualization.png"
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """
+    Parse image into clothing regions: shirt, pants, shoes
+    Tries multiple methods in order of preference.
+    Automatically removes legs from pants mask when shorts are detected.
+    
+    Returns:
+        img_rgb: Original image as numpy array
+        masks: Dict with keys "shirt", "pants", "shoes", each containing a boolean mask
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load image (with EXIF orientation correction)
+    img = load_image_with_orientation(image_path)
+    img_rgb = np.array(img)
+    
+    # Try MediaPipe first (fast, good for person segmentation)
+    masks = parse_with_mediapipe(img_rgb)
+    
+    if masks is None:
+        # Fallback to geometric parser (always works)
+        print("[Info] Using geometric parser (fallback method)")
+        masks = parse_with_geometric(img_rgb)
+    else:
+        print("[Info] Using MediaPipe parser")
+    
+    # Note: Leg removal will be done after classification if shorts are detected
+    # (See adjust_masks_based_on_classifier in output.py)
+    
+    # Visualize if requested
+    if visualize:
+        try:
+            visualize_parsed_regions(img_rgb, masks, save_path=vis_save_path, show=False)
+        except Exception as e:
+            print(f"[Warning] Could not create matplotlib visualization: {e}")
+            print("[Info] Trying simple PIL visualization...")
+            try:
+                visualize_parsed_regions_simple(img_rgb, masks, save_path=vis_save_path.replace('.png', '_simple.png'))
+            except Exception as e2:
+                print(f"[Warning] Could not create simple visualization: {e2}")
+    
+    return img_rgb, masks
+
+
+def extract_colors_from_regions(img_rgb: np.ndarray, masks: Dict[str, np.ndarray]) -> Dict[str, Dict[str, Optional[str]]]:
+    """
+    Extract colors from parsed regions.
+    
+    Returns:
+        {
+            "shirt": {...},
+            "pants": {...},
+            "shoes": {...}
+        }
+    """
+    colors = {}
+    for region_name, mask in masks.items():
+        colors[region_name] = extract_color_from_region(img_rgb, mask, region_name=region_name)
+    
+    return colors
+
+
+def calculate_color_extraction_confidence(
+    masks: Dict[str, np.ndarray],
+    matched_colors: Dict[str, Dict],
+    classifier_colors: Dict[str, str]
+) -> Dict[str, float]:
+    """
+    Calculate confidence for color extraction per region.
+    Based on:
+    - Parser region quality (size, coverage)
+    - Color extraction success
+    - Classifier prediction agreement
+    """
+    confidences = {}
+    h, w = masks.get("shirt", np.zeros((1, 1), dtype=bool)).shape
+    total_pixels = h * w if h > 0 and w > 0 else 1
+    
+    color_to_region = {
+        "color_0": "shirt",
+        "color_1": "pants",
+        "color_2": "shoes"
+    }
+    
+    for color_key, region_name in color_to_region.items():
+        if region_name not in masks:
+            confidences[region_name] = 0.0
+            continue
+        
+        mask = masks[region_name]
+        region_size = mask.sum()
+        coverage = region_size / total_pixels if total_pixels > 0 else 0.0
+        
+        # Parser confidence: based on region coverage
+        # Good coverage: >5% of image = high confidence
+        parser_conf = min(coverage * 20, 1.0)  # 5% coverage = 1.0
+        
+        # Color extraction confidence
+        region_color = matched_colors.get(region_name, {})
+        color_extracted = 1.0 if region_color.get("hex") else 0.0
+        
+        # Classifier confidence: if classifier says "NA", lower confidence
+        classifier_pattern = classifier_colors.get(color_key, "NA")
+        classifier_conf = 1.0 if classifier_pattern != "NA" else 0.3
+        
+        # Combined: weighted average
+        # Parser quality (40%) + Color extraction (30%) + Classifier agreement (30%)
+        combined = (parser_conf * 0.4 + color_extracted * 0.3 + classifier_conf * 0.3)
+        confidences[region_name] = combined
+    
+    return confidences
+
+
+def get_overall_color_confidence(confidences: Dict[str, float]) -> float:
+    """Get overall color extraction confidence"""
+    if not confidences:
+        return 0.0
+    # Average of shirt, pants, shoes (exclude head)
+    clothing_regions = [confidences.get(r, 0.0) for r in ["shirt", "pants", "shoes"]]
+    return sum(clothing_regions) / len(clothing_regions) if clothing_regions else 0.0
+
+
+def extract_colors_guided_by_classifier(
+    img_rgb: np.ndarray,
+    masks: Dict[str, np.ndarray],
+    classifier_colors: Dict[str, str]  # {"color_0": "pure-color", "color_1": "striped", "color_2": "NA"}
+) -> Tuple[Dict[str, Dict], Dict[str, float]]:
+    """
+    Extract colors using classifier predictions as primary guide.
+    Uses classifier's color_0, color_1, color_2 to determine which regions to extract from.
+    
+    Strategy:
+    - color_0 → shirt (top region)
+    - color_1 → pants (lower region)
+    - color_2 → shoes (footwear region)
+    - Only extract RGB from regions that classifier identified (skip "NA")
+    - Use pattern info (pure-color vs striped) to adjust extraction
+    
+    Args:
+        img_rgb: Original image as numpy array [H, W, 3]
+        masks: Dict with keys "shirt", "pants", "shoes", each containing boolean mask
+        classifier_colors: {"color_0": "pure-color", "color_1": "striped", "color_2": "NA"}
+    
+    Returns:
+        {
+            "shirt": {
+                "hex": "#...",
+                "name": "blue",
+                "rgb": [r, g, b],
+                "pattern": "pure-color",  # from classifier
+                "classifier_source": "color_0"
+            },
+            ...
+        }
+    """
+    # Direct mapping: classifier color predictions → regions
+    color_to_region = {
+        "color_0": "shirt",  # Primary top color
+        "color_1": "pants",  # Primary bottom color
+        "color_2": "shoes",  # Footwear color
+    }
+    
+    result = {}
+    
+    # Initialize all regions (excluding head)
+    for region_name in ["shirt", "pants", "shoes"]:
+        result[region_name] = {
+            "hex": None,
+            "name": None,
+            "rgb": None,
+            "pattern": None,
+            "classifier_source": None
+        }
+    
+    # Extract colors only from regions that classifier identified as "pure-color"
+    for color_key, region_name in color_to_region.items():
+        pattern = classifier_colors.get(color_key, "NA")
+        
+        # Skip if classifier says "NA" (no color detected)
+        if pattern == "NA":
+            continue
+        
+        # Only extract RGB colors when pattern is "pure-color"
+        # For other patterns (striped, graphic, floral, etc.), don't extract a single color
+        if pattern != "pure-color":
+            # Store pattern info but don't extract RGB color
+            result[region_name] = {
+                "hex": None,
+                "name": None,
+                "rgb": None,
+                "pattern": pattern,  # Store pattern info
+                "classifier_source": color_key
+            }
+            continue
+        
+        # Skip if region mask doesn't exist or is empty
+        if region_name not in masks or masks[region_name].sum() == 0:
+            continue
+        
+        # For shoes, exclude pants mask to prevent color contamination
+        exclude_mask = None
+        if region_name == "shoes" and "pants" in masks and masks["pants"].sum() > 0:
+            exclude_mask = masks["pants"]
+        
+        # Extract RGB color from this region
+        # Pass region_name to filter skin for pants/shirt, exclude_mask for shoes
+        region_color = extract_color_from_region(img_rgb, masks[region_name], region_name=region_name, exclude_mask=exclude_mask)
+        
+        if region_color["hex"] is not None:
+            result[region_name] = {
+                "hex": region_color["hex"],
+                "name": region_color["name"],
+                "rgb": region_color["rgb"],
+                "pattern": pattern,  # Classifier's pattern prediction
+                "classifier_source": color_key
+            }
+    
+    # Calculate confidence for each region
+    confidences = calculate_color_extraction_confidence(masks, result, classifier_colors)
+    
+    return result, confidences
+
+
+# =========================
+# VISUALIZATION
+# =========================
+
+def calculate_parsing_confidence(masks: Dict[str, np.ndarray]) -> Dict[str, float]:
+    """
+    Calculate simple parsing confidence based on region coverage.
+    
+    Args:
+        masks: Dict with region masks
+        
+    Returns:
+        Dict mapping region names to confidence values (0.0 to 1.0)
+    """
+    confidences = {}
+    h, w = next(iter(masks.values())).shape[:2] if masks else (1, 1)
+    total_pixels = h * w if h > 0 and w > 0 else 1
+    
+    # Expected coverage ranges for each region (as percentage of image)
+    expected_coverage = {
+        "shirt": (3.0, 15.0),   # Shirt: 3-15% of image
+        "pants": (5.0, 20.0),   # Pants: 5-20% of image
+        "shoes": (1.0, 8.0),    # Shoes: 1-8% of image
+    }
+    
+    for region_name, mask in masks.items():
+        if mask.sum() == 0:
+            confidences[region_name] = 0.0
+            continue
+        
+        coverage = (mask.sum() / total_pixels) * 100.0
+        
+        # Check if coverage is within expected range
+        if region_name in expected_coverage:
+            min_coverage, max_coverage = expected_coverage[region_name]
+            if min_coverage <= coverage <= max_coverage:
+                # Within expected range: high confidence
+                confidences[region_name] = 0.9
+            elif coverage < min_coverage:
+                # Below expected: lower confidence, scale linearly
+                confidences[region_name] = max(0.3, (coverage / min_coverage) * 0.7)
+            else:
+                # Above expected: slightly lower confidence
+                ratio = max_coverage / coverage if coverage > 0 else 0
+                confidences[region_name] = max(0.5, ratio * 0.8)
+        else:
+            # Default confidence if no expected range
+            confidences[region_name] = 0.7 if coverage > 1.0 else 0.3
+    
+    return confidences
+
+
+def visualize_parsed_regions(
+    img_rgb: np.ndarray,
+    masks: Dict[str, np.ndarray],
+    save_path: str = "parsed_regions_visualization.png",
+    show: bool = False,
+    matched_colors: Optional[Dict[str, Dict]] = None,
+    color_confidences: Optional[Dict[str, float]] = None
+) -> None:
+    """
+    Visualize parsed clothing regions with color overlays using matplotlib.
+    Includes extracted colors, hexcodes, color squares, and confidence levels for each region.
+    
+    Args:
+        img_rgb: Original image as numpy array [H, W, 3]
+        masks: Dict with keys "shirt", "pants", "shoes", each containing boolean mask
+        save_path: Path to save visualization
+        show: Whether to display the visualization
+        matched_colors: Optional dict with color info per region (from extract_colors_guided_by_classifier)
+        color_confidences: Optional dict with confidence scores per region
+    """
+    if not MATPLOTLIB_AVAILABLE:
+        print("[Warning] Matplotlib not available. Using simple PIL visualization instead.")
+        visualize_parsed_regions_simple(img_rgb, masks, save_path)
+        return
+    
+    # Extract actual colors from each region
+    extracted_colors = {}
+    for region_name, mask in masks.items():
+        if mask.sum() > 0:
+            color_data = extract_color_from_region(img_rgb, mask, region_name=region_name)
+            extracted_colors[region_name] = color_data
+    
+    # Region colors for visualization overlay (semi-transparent)
+    region_overlay_colors = {
+        "shirt": [0, 255, 0, 128],     # Green (semi-transparent)
+        "pants": [0, 0, 255, 128],     # Blue (semi-transparent)
+        "shoes": [255, 255, 0, 128],   # Yellow (semi-transparent)
+    }
+    
+    # Create overlay image
+    overlay = img_rgb.copy().astype(np.float32)
+    
+    # Apply colored overlays for each region
+    for region_name, color in region_overlay_colors.items():
+        if region_name in masks:
+            mask = masks[region_name]
+            if mask.sum() > 0:  # Only if region exists
+                # Create colored overlay
+                color_overlay = np.zeros_like(img_rgb, dtype=np.float32)
+                color_overlay[mask] = color[:3]  # RGB only
+                
+                # Blend with original image
+                alpha = color[3] / 255.0
+                overlay[mask] = overlay[mask] * (1 - alpha) + color_overlay[mask] * alpha
+    
+    # Convert back to uint8
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    
+    # Create visualization with matplotlib (wider figure to accommodate legend)
+    # Use GridSpec for better layout control
+    fig = plt.figure(figsize=(24, 12))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 0.8], hspace=0.05, wspace=0.15)
+    
+    # Left: Original image
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax0.imshow(img_rgb)
+    ax0.set_title("Original Image", fontsize=20, fontweight='bold', pad=15)
+    ax0.axis('off')
+    
+    # Middle: Parsed regions with overlay (no text overlays)
+    ax1 = fig.add_subplot(gs[0, 1])
+    ax1.imshow(overlay)
+    ax1.set_title("Parsed Regions (Overlay)", fontsize=20, fontweight='bold', pad=15)
+    ax1.axis('off')
+    
+    # Add legend with hex codes, color squares, and confidence
+    legend_elements = []
+    for region_name, color in region_overlay_colors.items():
+        if region_name in masks and masks[region_name].sum() > 0:
+            mask = masks[region_name]
+            # Count pixels in region
+            pixel_count = masks[region_name].sum()
+            percentage = (pixel_count / masks[region_name].size) * 100
+            
+            # Build label with hex code and confidence
+            label_parts = [f"{region_name.capitalize()}", f"({pixel_count} px, {percentage:.1f}%)"]
+            
+            # Get actual extracted color for the patch if available, otherwise use overlay color
+            patch_color = [c/255.0 for c in color[:3]]
+            hex_code = None
+            
+            if matched_colors and region_name in matched_colors:
+                region_color_data = matched_colors[region_name]
+                hex_code = region_color_data.get('hex')
+                if hex_code:
+                    # Parse hex code to RGB for patch color
+                    hex_clean = hex_code.lstrip('#')
+                    if len(hex_clean) == 6:
+                        try:
+                            r = int(hex_clean[0:2], 16)
+                            g = int(hex_clean[2:4], 16)
+                            b = int(hex_clean[4:6], 16)
+                            patch_color = [r/255.0, g/255.0, b/255.0]
+                            label_parts.append(f"Hex: {hex_code}")
+                        except ValueError:
+                            pass  # Use overlay color if hex parsing fails
+            
+            # Add confidence if available
+            if color_confidences and region_name in color_confidences:
+                conf = color_confidences[region_name]
+                conf_percent = conf * 100
+                label_parts.append(f"Conf: {conf_percent:.1f}%")
+            
+            label_text = "\n".join(label_parts)
+            
+            legend_elements.append(
+                mpatches.Patch(
+                    facecolor=patch_color,
+                    label=label_text,
+                    edgecolor='black',
+                    linewidth=1.5
+                )
+            )
+    
+    if legend_elements:
+        # Position legend with better spacing
+        ax1.legend(handles=legend_elements, loc='upper right', fontsize=9, 
+                  framealpha=0.95, handlelength=2.5, handletextpad=0.8,
+                  borderpad=0.8, labelspacing=1.2)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"[Visualization] Saved parsed regions to: {save_path}")
+    
+    if show:
+        plt.show()
+    else:
+        plt.close()
+
+
+def visualize_parsed_regions_simple(
+    img_rgb: np.ndarray,
+    masks: Dict[str, np.ndarray],
+    save_path: str = "parsed_regions_simple.png"
+) -> None:
+    """
+    Simple visualization using PIL (no matplotlib required).
+    Creates a side-by-side comparison.
+    """
+    h, w = img_rgb.shape[:2]
+    
+    # Create a new image with 2x width (original + overlay)
+    result_img = Image.new('RGB', (w * 2, h))
+    
+    # Left side: Original image
+    img_pil = Image.fromarray(img_rgb)
+    result_img.paste(img_pil, (0, 0))
+    
+    # Right side: Overlay with regions
+    overlay = img_rgb.copy().astype(np.float32)
+    
+    region_colors = {
+        "shirt": [0, 255, 0],     # Green
+        "pants": [0, 0, 255],     # Blue
+        "shoes": [255, 255, 0],   # Yellow
+    }
+    
+    # Apply colored overlays
+    for region_name, color in region_colors.items():
+        if region_name in masks:
+            mask = masks[region_name]
+            if mask.sum() > 0:
+                alpha = 0.4  # 40% opacity
+                overlay[mask] = overlay[mask] * (1 - alpha) + np.array(color) * alpha
+    
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    overlay_pil = Image.fromarray(overlay)
+    result_img.paste(overlay_pil, (w, 0))
+    
+    # Add text labels
+    draw = ImageDraw.Draw(result_img)
+    try:
+        # Try to use a default font
+        font = ImageFont.truetype("arial.ttf", 20)
+    except:
+        try:
+            font = ImageFont.load_default()
+        except:
+            font = None
+    
+    # Add labels
+    y_offset = 10
+    for region_name, color in region_colors.items():
+        if region_name in masks and masks[region_name].sum() > 0:
+            pixel_count = masks[region_name].sum()
+            percentage = (pixel_count / masks[region_name].size) * 100
+            label = f"{region_name.capitalize()}: {pixel_count}px ({percentage:.1f}%)"
+            draw.text((w + 10, y_offset), label, fill=tuple(color), font=font)
+            y_offset += 25
+    
+    result_img.save(save_path)
+    print(f"[Visualization] Saved simple visualization to: {save_path}")
+
