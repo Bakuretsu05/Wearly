@@ -41,20 +41,13 @@ frontend/dist/
 frontend/build/
 frontend/.vite/
 
-# Model checkpoints (large files)
-*.pth
-*.pt
+# Model checkpoints - Download from Google Drive (see README.md)
+# Exclude checkpoint files from git (they're downloaded separately)
 checkpoints/*.pth
 checkpoints/*.pt
-# Keep the checkpoints directory structure
-!checkpoints/.gitkeep
 
 # Dataset files (very large - exclude entire dataset directory)
 dataset/
-
-# Model checkpoints (large files)
-checkpoints/*.pth
-checkpoints/*.pt
 
 # Uploaded files
 uploads/*
@@ -69,6 +62,7 @@ vis_color_regions.png
 *.jpg
 *.png
 *.jpeg
+!jason.jpg
 !example*.jpg
 !test*.jpg
 !README*.jpg
@@ -137,4 +131,3 @@ celerybeat.pid
 .mypy_cache/
 .dmypy.json
 dmypy.json
-
