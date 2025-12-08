@@ -69,7 +69,6 @@ vis_color_regions.png
 *.jpg
 *.png
 *.jpeg
-!jason.jpg
 !example*.jpg
 !test*.jpg
 !README*.jpg
