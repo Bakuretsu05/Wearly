@@ -107,16 +107,16 @@ npm run dev -- --host
     - View clothing analysis results
 
 ## Bugs
-"No Module Name sklearn":
-run this:
+"No Module Name sklearn":\
+run this:\
 ```bash
 .venv\Scripts\activate
 pip uninstall -y sklearn scikit-learn
 pip cache purge
 python -c "import sklearn; print(sklearn.__version__)"
 ```
-if a version of sklearn gets outputted then sklearn has been properly installed
-Restart the backend api by running:
+if a version of sklearn gets outputted then sklearn has been properly installed\
+Restart the backend api by running:\
 ```bash
 crtl + c 
 python backend_api.py
