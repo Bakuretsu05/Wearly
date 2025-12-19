@@ -43,7 +43,7 @@ AI-powered clothing detection and style evaluation system with React frontend an
     echo "OPENAI_API_KEY=your_openai_key_here" > .env
     ```
 
-    **Or manually create `.env` file** with:
+    **Or manually create `.env` file** in your IDE containing:
 
     ```
     OPENAI_API_KEY=your_openai_key_here
@@ -105,6 +105,22 @@ npm run dev -- --host
     - Take photos with your phone's camera
     - Upload images from gallery
     - View clothing analysis results
+
+## Bugs
+"No Module Name sklearn":
+run this:
+```bash
+.venv\Scripts\activate
+pip uninstall -y sklearn scikit-learn
+pip cache purge
+python -c "import sklearn; print(sklearn.__version__)"
+```
+if a version of sklearn gets outputted then sklearn has been properly installed
+Restart the backend api by running:
+```bash
+crtl + c 
+python backend_api.py
+```
 
 ## Features
 
