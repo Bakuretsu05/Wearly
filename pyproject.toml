@@ -15,9 +15,13 @@ dependencies = [
     "python-dotenv",
     "flask",
     "flask-cors",
+    "scikit-learn",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
 
